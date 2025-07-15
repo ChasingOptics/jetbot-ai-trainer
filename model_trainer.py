@@ -1,44 +1,50 @@
+# model_trainer.py
+
 import os
 import glob
 import time
 import numpy as np
+import warnings
+from PIL import Image
+
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-import multiprocessing
-from torchvision import transforms, models
 from torch.utils.data import DataLoader, random_split
-from PIL import Image
+from torchvision import transforms, models
 import torchvision.transforms.functional as TF
+import torch_directml
 
-# === Helper Functions ===
+# === Suppress Deprecation Warnings ===
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# === Set device ===
+device = torch_directml.device()
+print(f"🧠 Using DirectML device: {device}")
+
+# === Helper functions ===
 def get_x(path):
     return (float(int(path[3:6])) - 50.0) / 50.0
 
 def get_y(path):
     return (float(int(path[7:10])) - 50.0) / 50.0
 
-# === Dataset Class with Deduplication ===
+# === Custom dataset ===
 class XYDataset(torch.utils.data.Dataset):
     def __init__(self, directory, random_hflips=False):
+        self.directory = directory
         self.random_hflips = random_hflips
-
-        # Collect all image paths, then dedupe
-        paths = []
-        for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG'):
-            paths.extend(glob.glob(os.path.join(directory, ext)))
-        self.image_paths = sorted(set(paths))
-
+        self.image_paths = glob.glob(os.path.join(self.directory, '*.jpg'))
         self.color_jitter = transforms.ColorJitter(0.3, 0.3, 0.3, 0.3)
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        image = Image.open(img_path).convert('RGB')
-        x = get_x(os.path.basename(img_path))
-        y = get_y(os.path.basename(img_path))
+        image_path = self.image_paths[idx]
+        image = Image.open(image_path).convert('RGB')
+        x = float(get_x(os.path.basename(image_path)))
+        y = float(get_y(os.path.basename(image_path)))
 
         if self.random_hflips and np.random.rand() > 0.5:
             image = TF.hflip(image)
@@ -51,89 +57,81 @@ class XYDataset(torch.utils.data.Dataset):
 
         return image, torch.tensor([x, y]).float()
 
-if __name__ == "__main__":
-    # --- Configuration ---
-    DATA_DIR     = 'dataset_xy'
-    BATCH_SIZE   = 32
-    NUM_EPOCHS   = 50
-    TEST_FRAC    = 0.1
-    NUM_WORKERS  = min(8, multiprocessing.cpu_count())
-    USE_CUDA     = torch.cuda.is_available()
-    DEVICE       = torch.device('cuda' if USE_CUDA else 'cpu')
+# === Load dataset ===
+dataset = XYDataset('dataset_xy', random_hflips=True)
+print(f"📂 Found {len(dataset)} images")
 
-    # --- Startup Info ---
-    print(f"🖥️  Device: {DEVICE}")
-    print(f"📦 Dataset directory: {DATA_DIR}")
-    print(f"🔢 Num workers: {NUM_WORKERS}  |  Batch size: {BATCH_SIZE}")
+# === Split dataset ===
+test_percent = 0.1
+num_test = int(test_percent * len(dataset))
+train_dataset, test_dataset = random_split(dataset, [len(dataset) - num_test, num_test])
 
-    # --- Load Dataset ---
-    dataset = XYDataset(DATA_DIR, random_hflips=True)
-    print(f"🔍 Found {len(dataset)} images")
+# === DataLoaders ===
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=0)
+test_loader = DataLoader(test_dataset, batch_size=16, shuffle=True, num_workers=0)
 
-    # --- Warm-Up Load Test ---
-    loader_test = DataLoader(dataset, batch_size=BATCH_SIZE,
-                             num_workers=NUM_WORKERS, pin_memory=USE_CUDA)
-    imgs, lbls = next(iter(loader_test))
-    print(f"✅ Warm-up: loaded batch of {imgs.size(0)} images")
+# === Model ===
+model = models.resnet18(pretrained=True)
+model.fc = torch.nn.Linear(model.fc.in_features, 2)
+model = model.to(device)
 
-    # --- Split Dataset ---
-    num_test = int(TEST_FRAC * len(dataset))
-    train_ds, test_ds = random_split(dataset, [len(dataset) - num_test, num_test])
+# === Training settings ===
+NUM_EPOCHS = 100
+BEST_MODEL_PATH = 'best_steering_model_xy.pth'
+best_loss = 1e9
+no_improve_epochs = 0
+early_stop_patience = 10
 
-    # --- DataLoaders ---
-    train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=USE_CUDA
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=USE_CUDA
-    )
+optimizer = optim.Adam(model.parameters())
 
-    # --- Model & Optimizer ---
-    model = models.resnet18(pretrained=True)
-    model.fc = torch.nn.Linear(model.fc.in_features, 2)
-    model.to(DEVICE)
-    optimizer = optim.Adam(model.parameters())
-    best_loss = float('inf')
+# === Training loop ===
+for epoch in range(NUM_EPOCHS):
+    print(f"\n🟢 Starting Epoch {epoch + 1}/{NUM_EPOCHS}")
+    epoch_start = time.time()
 
-    # --- Training Loop ---
-    for epoch in range(1, NUM_EPOCHS + 1):
-        print(f"\n🟢 Starting Epoch {epoch}/{NUM_EPOCHS}")
-        start_time = time.time()
+    # Train
+    model.train()
+    train_loss = 0.0
+    for images, labels in train_loader:
+        images = images.to(device)
+        labels = labels.to(device)
 
-        # Training
-        model.train()
-        train_loss = 0.0
-        for imgs, lbls in train_loader:
-            imgs = imgs.to(DEVICE, non_blocking=True)
-            lbls = lbls.to(DEVICE, non_blocking=True)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = F.mse_loss(outputs, labels)
+        loss.backward()
+        optimizer.step()
 
-            optimizer.zero_grad()
-            out = model(imgs)
-            loss = F.mse_loss(out, lbls)
-            loss.backward()
-            optimizer.step()
+        train_loss += loss.item()
 
-            train_loss += loss.item()
-        train_loss /= len(train_loader)
+    train_loss /= len(train_loader)
 
-        # Evaluation
-        model.eval()
-        test_loss = 0.0
-        with torch.no_grad():
-            for imgs, lbls in test_loader:
-                imgs = imgs.to(DEVICE, non_blocking=True)
-                lbls = lbls.to(DEVICE, non_blocking=True)
-                out = model(imgs)
-                test_loss += F.mse_loss(out, lbls).item()
-        test_loss /= len(test_loader)
+    # Evaluate
+    model.eval()
+    test_loss = 0.0
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            outputs = model(images)
+            loss = F.mse_loss(outputs, labels)
+            test_loss += loss.item()
 
-        duration = time.time() - start_time
-        print(f"🔁 Epoch {epoch}/{NUM_EPOCHS} → Train: {train_loss:.4f}, Test: {test_loss:.4f}")
-        print(f"⏱️ Epoch {epoch} took {duration:.1f}s")
+    test_loss /= len(test_loader)
 
-        if test_loss < best_loss:
-            torch.save(model.state_dict(), 'best_steering_model_xy.pth')
-            best_loss = test_loss
-            print("✅ Saved new best model")
+    # Time reporting
+    epoch_time = time.time() - epoch_start
+    print(f"📉 Epoch {epoch+1} - Train Loss: {train_loss:.4f} | Test Loss: {test_loss:.4f} | ⏱️ Time: {epoch_time:.1f}s")
+
+    if test_loss < best_loss:
+        torch.save(model.state_dict(), BEST_MODEL_PATH)
+        best_loss = test_loss
+        no_improve_epochs = 0
+        print("✅ Best model saved.")
+    else:
+        no_improve_epochs += 1
+        print(f"⏸️ No improvement for {no_improve_epochs} epochs")
+
+    if no_improve_epochs >= early_stop_patience:
+        print("🛑 Early stopping triggered.")
+        break
